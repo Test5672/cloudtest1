@@ -1,64 +1,95 @@
-import os
 import asyncio
+import scratchattach as sa
+import aiohttp
 import threading
 import time
 import logging
-from datetime import datetime
-import scratchattach as sa
-from flask import Flask, jsonify
-import aiohttp
+from concurrent.futures import ThreadPoolExecutor
 
-# ----------------------------
-# Logging setup
-# ----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-# ----------------------------
-# Flask setup
-# ----------------------------
-app = Flask(__name__)
+# ---- Your Unicode encoding setup ----
+allowed_chars = [" ","!","\"","#","$","%","&","'","(",")","*","+",",","-",".","/","0","1","2","3","4","5","6","7","8","9",
+                 ":",";","<","=",">","?","@","A","B","C","D","E","F","G","H","J","L","M","N","O","P","Q","R","S","T","U",
+                 "V","W","X","Y","Z","[","\\","]","^","_","","a","b","c","d","e","f","g","h","j","l","m","n","o","p",
+                 "q","r","s","t","u","v","w","x","y","z","{","|","}","~"]
+char_to_idx = {c: i+1 for i, c in enumerate(allowed_chars)}
+idx_to_char = {i+1: c for i, c in enumerate(allowed_chars)}
 
-@app.route("/")
-def index():
-    return "Scratch Cloud Proxy is running.", 200
+def string_to_utf16_units(s):
+    b = s.encode("utf-16-be")
+    return [(b[i]<<8) + b[i+1] for i in range(0, len(b), 2)]
 
-# ----------------------------
-# Proxy Service
-# ----------------------------
+def utf16_units_to_string(units):
+    b = bytearray()
+    for u in units:
+        b.extend([(u >> 8) & 0xFF, u & 0xFF])
+    return bytes(b).decode("utf-16-be")
+
+def encode_string(s):
+    units = string_to_utf16_units(s)
+    result = []
+    for u in units:
+        c = chr(u)
+        if c in char_to_idx:
+            result.append(f"{char_to_idx[c]:02}")
+        else:
+            code = u + 1
+            s_code = str(code).zfill(5)
+            result.append(f"{93 + int(s_code[0])}{s_code[1:]}")
+    return "".join(result)
+
+def decode_string(encoded):
+    i = 0
+    units = []
+    while i < len(encoded):
+        prefix = int(encoded[i:i+2])
+        if 1 <= prefix <= len(allowed_chars):
+            c = idx_to_char[prefix]
+            units.append(ord(c))
+            i += 2
+        elif prefix >= 94:
+            d = prefix - 93
+            s_code = str(d) + encoded[i+2:i+6]
+            u = int(s_code) - 1
+            units.append(u)
+            i += 6
+        else:
+            raise ValueError(f"Invalid prefix at position {i}: {prefix}")
+    return utf16_units_to_string(units)
+
+# ---- Proxy service ----
 class ProxyService:
-    def __init__(self, project_id, username=None, password=None):
-        self.PROJECT_ID = project_id
-        self.username = username
-        self.password = password
-        self.cloud = None
-        self.events = None
+    def __init__(self, log_request_callback, log_error_callback):
+        self.log_request = log_request_callback
+        self.log_error = log_error_callback
+        self.running = False
         self.loop = None
         self.thread = None
-        self.running = False
+        self.cloud = None
+        self.events = None
         self.updating = False
         self.MAX_CLOUD_LENGTH = 100_000
         self.REQUEST_ID_LEN = 9
 
-    # ------------------------
-    # ASCII encoding helpers
-    # ------------------------
-    def digits_to_ascii(self, digits):
+        # ThreadPool for CPU-heavy encoding/decoding
+        self.executor = ThreadPoolExecutor(max_workers=4)
+
+    # Use your Unicode encoder/decoder
+    def digits_to_text(self, digits):
         try:
-            return ''.join(chr(int(digits[i:i+5])) for i in range(0, len(digits), 5))
+            return decode_string(digits)
         except Exception as e:
-            logger.error(f"ASCII decode error: {e}")
+            self.log_error("Decode error", str(e))
             return ""
 
-    def ascii_to_digits(self, text):
-        return ''.join(f"{ord(c):05}" for c in text)
+    def text_to_digits(self, text):
+        try:
+            return encode_string(text)
+        except Exception as e:
+            self.log_error("Encode error", str(e))
+            return ""
 
-    # ------------------------
-    # HTTP fetch
-    # ------------------------
     async def fetch_from_web(self, method, url, body=None):
         start_time = time.time()
         async with aiohttp.ClientSession() as session:
@@ -75,121 +106,79 @@ class ProxyService:
                 return response, duration_ms
             except Exception as e:
                 duration_ms = int((time.time() - start_time) * 1000)
-                logger.error(f"HTTP request error: {method} {url}: {str(e)}")
+                self.log_error("HTTP request error", f"{method} {url}: {str(e)}")
                 return f"Error: {str(e)}", duration_ms
 
-    # ------------------------
-    # Cloud variable event
-    # ------------------------
     def on_set(self, event):
-        if event.var != "CLOUD1" or self.updating:
-            return
-
+        if event.var != "CLOUD1" or self.updating: return
         raw = str(event.value)
-        if not raw.startswith("9") or len(raw) < 20:
-            return
-
+        if not raw.startswith("9") or len(raw) < 20: return
         request_id = raw[1:10]
         try:
             header_len = int(raw[10:15])
             body_len = int(raw[15:20])
         except ValueError:
-            logger.error(f"Parse error for request {request_id}")
+            self.log_error("Parse error", f"Request {request_id}: Invalid header/body lengths")
             return
-
         total_needed_len = 20 + header_len + body_len
         if len(raw) < total_needed_len:
-            logger.error(f"Incomplete message for request {request_id}")
+            self.log_error("Parse error", f"Request {request_id}: Incomplete message")
             return
 
         header_digits = raw[20:20 + header_len]
         body_digits = raw[20 + header_len:20 + header_len + body_len]
 
-        header = self.digits_to_ascii(header_digits)
-        body = self.digits_to_ascii(body_digits)
+        # Decode header/body using thread pool
+        header = self.loop.run_in_executor(self.executor, self.digits_to_text, header_digits)
+        body = self.loop.run_in_executor(self.executor, self.digits_to_text, body_digits)
 
-        try:
-            method, url = header.strip().split(" ", 1)
-        except ValueError:
-            logger.error(f"Header format error for request {request_id}")
-            return
+        async def process():
+            header_val = await header
+            body_val = await body
+            try:
+                method, url = header_val.strip().split(" ", 1)
+            except ValueError:
+                self.log_error("Parse error", f"Request {request_id}: Header should be 'METHOD URL'")
+                return
+            await self.handle_request(request_id, method, url, body_val)
+        asyncio.run_coroutine_threadsafe(process(), self.loop)
 
-        # Async request
-        asyncio.run_coroutine_threadsafe(
-            self.handle_request(request_id, method, url, body),
-            self.loop
-        )
-
-    # ------------------------
-    # Handle request
-    # ------------------------
     async def handle_request(self, request_id, method, url, body):
         response_text, duration_ms = await self.fetch_from_web(method, url, body)
-
-        max_response_chars = (self.MAX_CLOUD_LENGTH - self.REQUEST_ID_LEN) // 5
+        max_response_chars = (self.MAX_CLOUD_LENGTH - self.REQUEST_ID_LEN) // 6
         response_text = response_text[:max_response_chars]
-        result = request_id + self.ascii_to_digits(response_text)
 
+        # Encode response using thread pool
+        response_encoded = await self.loop.run_in_executor(self.executor, self.text_to_digits, response_text)
+        result = request_id + response_encoded
         self.updating = True
         try:
             self.cloud.set_var("CLOUD1", result[:self.MAX_CLOUD_LENGTH])
-            logger.info(f"Response sent for request {request_id} ({len(result)} chars)")
-        except Exception as e:
-            logger.error(f"Cloud variable error for request {request_id}: {str(e)}")
+            self.log_request(request_id, method, url, body, len(response_text), duration_ms)
         finally:
             await asyncio.sleep(0.5)
             self.updating = False
 
-    # ------------------------
-    # Event loop thread
-    # ------------------------
     def run_event_loop(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-
         try:
-            self.cloud = sa.TwCloud(project_id=self.PROJECT_ID)
+            self.cloud = sa.TwCloud(project_id="1197011359")
             self.events = self.cloud.events()
             self.events.event(self.on_set)
             self.events.start()
-            logger.info(f"Connected to Scratch project {self.PROJECT_ID}")
             self.loop.run_forever()
-        except Exception as e:
-            logger.error(f"Failed to start event loop: {str(e)}")
         finally:
             self.loop.close()
 
-    # ------------------------
-    # Start/stop service
-    # ------------------------
     def start(self):
-        if self.running:
-            return
+        if self.running: return
         self.running = True
         self.thread = threading.Thread(target=self.run_event_loop, daemon=True)
         self.thread.start()
-        logger.info("Proxy service started successfully")
 
     def stop(self):
-        if not self.running:
-            return
+        if not self.running: return
         self.running = False
-        if self.events:
-            self.events.stop()
-        if self.loop and self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
-        logger.info("Proxy service stopped")
-
-# ----------------------------
-# Initialize proxy using env variables
-# ----------------------------
-PROJECT_ID = os.getenv("SCRATCH_PROJECT_ID", "1197011359")
-proxy_service = ProxyService(PROJECT_ID)
-proxy_service.start()
-
-# ----------------------------
-# Run Flask (Render compatible)
-# ----------------------------
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 3000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+        if self.events: self.events.stop()
+        if self.loop and self.loop.is_running(): self.loop.call_soon_threadsafe(self.loop.stop)
