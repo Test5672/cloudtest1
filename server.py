@@ -1,10 +1,10 @@
 import asyncio
 import scratchattach as sa
 import aiohttp
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import logging
-from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -71,11 +71,8 @@ class ProxyService:
         self.updating = False
         self.MAX_CLOUD_LENGTH = 100_000
         self.REQUEST_ID_LEN = 9
-
-        # ThreadPool for CPU-heavy encoding/decoding
         self.executor = ThreadPoolExecutor(max_workers=4)
 
-    # Use your Unicode encoder/decoder
     def digits_to_text(self, digits):
         try:
             return decode_string(digits)
@@ -110,9 +107,11 @@ class ProxyService:
                 return f"Error: {str(e)}", duration_ms
 
     def on_set(self, event):
-        if event.var != "CLOUD1" or self.updating: return
+        if event.var != "CLOUD1" or self.updating:
+            return
         raw = str(event.value)
-        if not raw.startswith("9") or len(raw) < 20: return
+        if not raw.startswith("9") or len(raw) < 20:
+            return
         request_id = raw[1:10]
         try:
             header_len = int(raw[10:15])
@@ -120,6 +119,7 @@ class ProxyService:
         except ValueError:
             self.log_error("Parse error", f"Request {request_id}: Invalid header/body lengths")
             return
+
         total_needed_len = 20 + header_len + body_len
         if len(raw) < total_needed_len:
             self.log_error("Parse error", f"Request {request_id}: Incomplete message")
@@ -128,28 +128,29 @@ class ProxyService:
         header_digits = raw[20:20 + header_len]
         body_digits = raw[20 + header_len:20 + header_len + body_len]
 
-        # Decode header/body using thread pool
-        header = self.loop.run_in_executor(self.executor, self.digits_to_text, header_digits)
-        body = self.loop.run_in_executor(self.executor, self.digits_to_text, body_digits)
+        # Decode using thread pool
+        header_fut = self.loop.run_in_executor(self.executor, self.digits_to_text, header_digits)
+        body_fut = self.loop.run_in_executor(self.executor, self.digits_to_text, body_digits)
 
-        async def process():
-            header_val = await header
-            body_val = await body
+        async def process_request():
+            header_val = await header_fut
+            body_val = await body_fut
             try:
                 method, url = header_val.strip().split(" ", 1)
             except ValueError:
                 self.log_error("Parse error", f"Request {request_id}: Header should be 'METHOD URL'")
                 return
             await self.handle_request(request_id, method, url, body_val)
-        asyncio.run_coroutine_threadsafe(process(), self.loop)
+
+        asyncio.run_coroutine_threadsafe(process_request(), self.loop)
 
     async def handle_request(self, request_id, method, url, body):
         response_text, duration_ms = await self.fetch_from_web(method, url, body)
         max_response_chars = (self.MAX_CLOUD_LENGTH - self.REQUEST_ID_LEN) // 6
         response_text = response_text[:max_response_chars]
 
-        # Encode response using thread pool
         response_encoded = await self.loop.run_in_executor(self.executor, self.text_to_digits, response_text)
+
         result = request_id + response_encoded
         self.updating = True
         try:
@@ -162,14 +163,11 @@ class ProxyService:
     def run_event_loop(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
-        try:
-            self.cloud = sa.TwCloud(project_id="1197011359")
-            self.events = self.cloud.events()
-            self.events.event(self.on_set)
-            self.events.start()
-            self.loop.run_forever()
-        finally:
-            self.loop.close()
+        self.cloud = sa.TwCloud(project_id="1197011359")
+        self.events = self.cloud.events()
+        self.events.event(self.on_set)
+        self.events.start()
+        self.loop.run_forever()
 
     def start(self):
         if self.running: return
@@ -181,4 +179,14 @@ class ProxyService:
         if not self.running: return
         self.running = False
         if self.events: self.events.stop()
-        if self.loop and self.loop.is_running(): self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+# Example usage
+if __name__ == "__main__":
+    service = ProxyService(
+        log_request_callback=lambda *a: print("Request:", *a),
+        log_error_callback=lambda *a: print("Error:", *a)
+    )
+    service.start()
+    threading.Event().wait()  # Keep main thread alive
