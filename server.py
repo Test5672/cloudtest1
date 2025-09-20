@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import logging
+import os
+from flask import Flask
 
 logger = logging.getLogger(__name__)
 
@@ -182,11 +184,20 @@ class ProxyService:
         if self.loop and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.loop.stop)
 
-# Example usage
+# ---- Flask web service for Render ----
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Proxy service running!"
+
 if __name__ == "__main__":
     service = ProxyService(
         log_request_callback=lambda *a: print("Request:", *a),
         log_error_callback=lambda *a: print("Error:", *a)
     )
     service.start()
-    threading.Event().wait()  # Keep main thread alive
+
+    # Start Flask on the Render-assigned port
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
