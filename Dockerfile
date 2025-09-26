@@ -1,5 +1,5 @@
-# Use Python 3.10 (compatible with scratchattach)
-FROM python:3.10-slim
+# Use Python 3.12 (compatible with scratchattach)
+FROM python:3.12-slim
 
 # Set working directory
 WORKDIR /app
@@ -10,14 +10,11 @@ COPY requirements.txt .
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the rest of the app
+# Copy app code
 COPY . .
 
-# Expose the port (Render sets $PORT automatically)
+# Expose port (Render sets $PORT)
 EXPOSE 10000
-
-# Set environment variable for Render
-ENV PORT=10000
 
 # Make start script executable
 RUN chmod +x start.sh
